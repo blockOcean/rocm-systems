@@ -2535,7 +2535,10 @@ ib_recv:
 
   // Store the remote CTS FIFO info provided by the remote peer
   rComm->remCtsFifo.addr = remMeta.addr;
-  rComm->remSegLayout.addr = remMeta.addr + sizeof(((struct ncclIbSendComm*)0)->ctsFifo);
+  if (rComm->peerCaps & NCCL_IB_CAP_MULTISEG) {
+    NCCLCHECKGOTO(ncclIbMalloc((void**)&rComm->remSegLayout, sizeof(*rComm->remSegLayout)), ret, fail);
+    rComm->remSegLayout->addr = remMeta.addr + sizeof(((struct ncclIbSendComm*)0)->ctsFifo);
+  }
   for (int i = 0; i < rComm->base.nRemDevs; i++) {
     rComm->remCtsFifo.rkeys[i] = remMeta.devs[i].rkey;
   }
@@ -2549,8 +2552,8 @@ ib_recv:
                   ret, fail);
     rCommDev->sge.lkey = rCommDev->ctsFifoMr->lkey;
     if (rComm->peerCaps & NCCL_IB_CAP_MULTISEG) {
-      NCCLCHECKGOTO(wrap_ibv_reg_mr(&rCommDev->segLayoutFifoMr, rCommDev->base.pd, &rComm->remSegLayout.elems,
-                                    sizeof(rComm->remSegLayout.elems), IBV_ACCESS_LOCAL_WRITE),
+      NCCLCHECKGOTO(wrap_ibv_reg_mr(&rCommDev->segLayoutFifoMr, rCommDev->base.pd, rComm->remSegLayout->elems,
+                                    sizeof(rComm->remSegLayout->elems), IBV_ACCESS_LOCAL_WRITE),
                     ret, fail);
     }
 
@@ -2703,6 +2706,7 @@ fail:
     (void)IbCastCloseRecv(rComm);
     stage->comm = NULL;
   } else {
+    if (rComm) free(rComm->remSegLayout);
     free(rComm);
   }
   goto exit;
@@ -2903,6 +2907,7 @@ ncclResult_t IbCastCloseRecv(void* recvComm) {
     if (comm->base.resiliency) {
       NCCLCHECK(IbCastResiliencyDestroy(&comm->base.resiliency));
     }
+    free(comm->remSegLayout);
     free(comm);
   }
   return ncclSuccess;
