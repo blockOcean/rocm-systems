@@ -4,7 +4,8 @@
 #pragma once
 
 /// @file gfx12_dot.h
-/// @brief Hardware-characterized GFX12 DOT2 and WMMA arithmetic with F32 or packed outputs.
+/// @brief Hardware-characterized GFX12 DOT2, FP8/BF8 DOT4 and WMMA arithmetic with F32 or packed
+/// outputs.
 
 #include "dot_packed16.h"
 
@@ -13,6 +14,7 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 namespace rocjitsu::amdgpu {
 namespace gfx12_dot_detail {
@@ -34,26 +36,45 @@ struct Term {
   }
 };
 
-template <bool Bf16> struct Factor {
-  static constexpr int fraction_bits = Bf16 ? 7 : 10;
-  static constexpr int bias = Bf16 ? 127 : 15;
-  static constexpr uint16_t fraction_mask = (1u << fraction_bits) - 1;
-  static constexpr uint16_t infinity = Bf16 ? 0x7f80 : 0x7c00;
+/// @brief Factor encoding: exponent and fraction widths. OCP E4M3 has no
+/// infinity; S.1111.111 is its only NaN.
+template <int ExponentBits, int FractionBits, bool OcpE4m3 = false> struct FactorFormat {
+  static constexpr int exponent_bits = ExponentBits;
+  static constexpr int fraction_bits = FractionBits;
+  static constexpr int bias = (1 << (ExponentBits - 1)) - 1;
+  static constexpr bool ocp_e4m3 = OcpE4m3;
+};
+using F16Factor = FactorFormat<5, 10>;
+using Bf16Factor = FactorFormat<8, 7>;
+using Fp8Factor = FactorFormat<4, 3, true>;
+using Bf8Factor = FactorFormat<5, 2>;
+template <bool Bf16> using HalfFactor = std::conditional_t<Bf16, Bf16Factor, F16Factor>;
+
+template <typename Format> struct Factor {
+  static constexpr int fraction_bits = Format::fraction_bits;
+  static constexpr unsigned fraction_mask = (1u << fraction_bits) - 1;
+  static constexpr unsigned exponent_max = (1u << Format::exponent_bits) - 1;
   uint16_t bits;
 
-  bool nan() const { return (bits & 0x7fff) > infinity; }
-  bool inf() const { return (bits & 0x7fff) == infinity; }
-  bool negative() const { return bits >> 15; }
-  unsigned exponent_field() const { return (bits & 0x7fff) >> fraction_bits; }
-  uint64_t significand() const {
-    if (exponent_field())
-      return (1u << fraction_bits) | (bits & fraction_mask);
-    return bits & fraction_mask;
+  unsigned exponent_field() const { return (bits >> fraction_bits) & exponent_max; }
+  unsigned fraction() const { return bits & fraction_mask; }
+  bool negative() const { return (bits >> (Format::exponent_bits + fraction_bits)) & 1; }
+  bool nan() const {
+    if (exponent_field() != exponent_max)
+      return false;
+    return Format::ocp_e4m3 ? fraction() == fraction_mask : fraction() != 0;
   }
-  int alignment_exponent() const { return int(std::max(exponent_field(), 1u)) - bias; }
-  Term product(Factor other) const {
+  bool inf() const {
+    return !Format::ocp_e4m3 && exponent_field() == exponent_max && fraction() == 0;
+  }
+  uint64_t significand() const {
+    return exponent_field() ? (1u << fraction_bits) | fraction() : fraction();
+  }
+  int alignment_exponent() const { return int(std::max(exponent_field(), 1u)) - Format::bias; }
+  template <typename Other> Term product(Factor<Other> other) const {
     return {significand() * other.significand(),
-            alignment_exponent() + other.alignment_exponent() - 2 * fraction_bits,
+            alignment_exponent() + other.alignment_exponent() - fraction_bits -
+                Factor<Other>::fraction_bits,
             negative() != other.negative()};
   }
 };
@@ -90,8 +111,9 @@ inline uint32_t pack(int64_t units, int grid) {
   return sign | (uint32_t(exponent + 127) << 23) | (uint32_t(significand) & 0x7fffff);
 }
 
-// Alignment discards low bits by arithmetic floor. An accumulator too small
-// to retain any magnitude bits contributes zero, including when negative.
+// Alignment discards low bits by arithmetic floor. With `accumulator` set, a
+// term too small to retain any magnitude bits contributes zero, even when
+// negative.
 inline int64_t align(Term term, int grid, bool accumulator = false) {
   const int shift = term.exponent - grid;
   const uint64_t magnitude = !term.significand || shift <= -64 ? 0
@@ -109,19 +131,28 @@ inline int64_t align(Term term, int grid, bool accumulator = false) {
 /// align and add products independently, then align those sums with C. F32 outputs
 /// round once to FP32 using RNE. Packed F16 rounds the integer sum directly to F16
 /// using RNE, with a C-alignment exponent floor of -14 and finite overflow controlled
-/// by fp16_ovfl. For packed F16, a negative C with discarded bits contributes a
-/// floor unit even when its aligned magnitude is zero, provided the grid is at or
-/// below -14. Packed BF16 instead truncates the rounded FP32 result. Packed WMMA
-/// applies this narrowing after every step. Subnormal inputs and outputs are
-/// preserved. Integer arithmetic preserves observed NaN payloads and makes results
-/// independent of the host FP state.
+/// by fp16_ovfl. A negative C with discarded bits contributes a floor unit even
+/// when its aligned magnitude is zero, provided the grid is at or below the C
+/// alignment floor (-14 for packed F16, -126 otherwise). Packed BF16 instead
+/// truncates the rounded FP32 result. Packed WMMA applies this narrowing after
+/// every step. Subnormal inputs and outputs are preserved. Integer arithmetic
+/// preserves observed NaN payloads and makes results independent of the host FP
+/// state. FP8/BF8 DOT4 differs in two ways: its four products align together
+/// on one grid, and an invalid product returns the factor-NaN payload.
 /// See tests/fixtures/float_dot/README.md for hardware qualification of
 /// https://github.com/ROCm/rocm-systems/issues/12056 on RDNA4.
-template <bool Bf16, bool Packed, std::size_t N>
-inline uint32_t gfx12_dot_bits(const std::array<uint16_t, N> &a, const std::array<uint16_t, N> &b,
-                               uint32_t acc, bool fp16_ovfl = false) {
+template <typename A, typename B, bool Packed, std::size_t N>
+inline uint32_t gfx12_dot_terms(const std::array<uint16_t, N> &a, const std::array<uint16_t, N> &b,
+                                uint32_t acc, bool fp16_ovfl = false) {
   static_assert(N == 2 || N == 4);
   using namespace gfx12_dot_detail;
+  // 8-bit factors align all products on one grid, and an invalid product
+  // returns the factor-NaN payload. 16-bit factors align products in pairs.
+  constexpr bool kByteFactors = A::exponent_bits + A::fraction_bits < 8;
+  constexpr std::size_t kGroup = kByteFactors ? N : 2;
+  constexpr uint32_t kInvalid = kByteFactors ? kFactorNan : kInvalidProductNan;
+  constexpr bool Bf16 = std::is_same_v<A, Bf16Factor>;
+  static_assert(!Packed || (std::is_same_v<A, B> && !kByteFactors));
   const auto special = [](uint32_t bits) -> uint32_t {
     if constexpr (Packed)
       return dot_packed16::special<Bf16>(bits);
@@ -134,7 +165,8 @@ inline uint32_t gfx12_dot_bits(const std::array<uint16_t, N> &a, const std::arra
   bool negative_inf = false;
   bool invalid = false;
   for (std::size_t i = 0; i < N; ++i) {
-    const Factor<Bf16> left{a[i]}, right{b[i]};
+    const Factor<A> left{a[i]};
+    const Factor<B> right{b[i]};
     if (left.nan() || right.nan())
       return special(kFactorNan);
     invalid |= (left.inf() && !right.significand()) || (right.inf() && !left.significand());
@@ -152,32 +184,36 @@ inline uint32_t gfx12_dot_bits(const std::array<uint16_t, N> &a, const std::arra
   }
   // Factor NaNs, then invalid products, precede an accumulator NaN.
   if (invalid || (positive_inf && negative_inf))
-    return special(kInvalidProductNan);
+    return special(kInvalid);
   if ((acc & 0x7fffffff) > 0x7f800000)
     return special(acc | kQuietNanBit);
   positive_inf |= acc == 0x7f800000;
   negative_inf |= acc == 0xff800000;
   if (positive_inf || negative_inf)
-    return special(positive_inf && negative_inf ? kInvalidProductNan
+    return special(positive_inf && negative_inf ? kInvalid
                    : negative_inf               ? 0xff800000
                                                 : 0x7f800000);
 
   const unsigned acc_exp = (acc >> 23) & 255;
   const Term c{acc_exp ? (acc & 0x7fffff) | 0x800000u : acc & 0x7fffff,
                int(std::max(acc_exp, 1u)) - 127 - 23, bool(acc >> 31)};
-  // Packed F16 floors C's alignment exponent at -14. A negative subnormal C
-  // contributes an arithmetic-floor unit if the grid is at or below -14,
-  // even when no magnitude bits survive. Coarser grids drop that tiny C.
-  const int grid =
-      std::max(product_grid, std::max(Packed && !Bf16 ? -14 : -126, c.leading_exponent()) - 26);
-  int64_t total = align(c, grid, !(Packed && !Bf16 && grid <= -14));
-  for (std::size_t i = 0; i < N; i += 2) {
-    const int pair_grid = std::max(product_grids[i], product_grids[i + 1]);
-    const int64_t pair = align(products[i], pair_grid) + align(products[i + 1], pair_grid);
-    const Term sum{uint64_t(pair < 0 ? -pair : pair), pair_grid, pair < 0};
-    total += align(sum, grid);
+  // C aligns no lower than -14 for packed F16 and -126 otherwise. When the
+  // grid is at or below that floor, a negative C contributes an
+  // arithmetic-floor unit even when no magnitude bits survive (seen on
+  // gfx1201 for subnormal C in F32 DOT2 and packed F16). Coarser grids drop
+  // that tiny C.
+  const int c_floor = Packed && !Bf16 ? -14 : -126;
+  const int grid = std::max(product_grid, std::max(c_floor, c.leading_exponent()) - 26);
+  int64_t total = align(c, grid, grid > c_floor);
+  for (std::size_t i = 0; i < N; i += kGroup) {
+    const int group_grid =
+        *std::max_element(product_grids.begin() + i, product_grids.begin() + i + kGroup);
+    int64_t group = 0;
+    for (std::size_t j = i; j < i + kGroup; ++j)
+      group += align(products[j], group_grid);
+    total += align(Term{uint64_t(group < 0 ? -group : group), group_grid, group < 0}, grid);
   }
-  // Pair alignment retains at most 27 magnitude bits; the final sum and C
+  // Group alignment retains at most 28 magnitude bits; the final sum and C
   // fit comfortably in int64_t. Zero, including underflow to zero, is positive.
   if constexpr (Packed) {
     if constexpr (Bf16)
@@ -186,6 +222,13 @@ inline uint32_t gfx12_dot_bits(const std::array<uint16_t, N> &a, const std::arra
       return dot_packed16::pack_f16(total, grid, false, fp16_ovfl);
   }
   return pack(total, grid);
+}
+
+template <bool Bf16, bool Packed, std::size_t N>
+inline uint32_t gfx12_dot_bits(const std::array<uint16_t, N> &a, const std::array<uint16_t, N> &b,
+                               uint32_t acc, bool fp16_ovfl = false) {
+  using Half = gfx12_dot_detail::HalfFactor<Bf16>;
+  return gfx12_dot_terms<Half, Half, Packed>(a, b, acc, fp16_ovfl);
 }
 
 template <bool Bf16, std::size_t N>
@@ -208,4 +251,26 @@ inline uint32_t gfx12_dot2_f32(uint16_t a0, uint16_t b0, uint16_t a1, uint16_t b
   return gfx12_dot_f32<Bf16>(std::array{a0, a1}, std::array{b0, b1}, acc);
 }
 
+/// @brief Widen packed C, execute one GFX12 DOT2 step and return packed result bits.
+/// @details This is also the arithmetic of VOP3 V_DOT2_F16_F16 and V_DOT2_BF16_BF16.
+template <bool Bf16>
+inline uint16_t gfx12_dot2_packed16(uint16_t a0, uint16_t b0, uint16_t a1, uint16_t b1,
+                                    uint16_t acc, bool fp16_ovfl = false) {
+  return uint16_t(gfx12_dot_bits<Bf16, true>(std::array{a0, a1}, std::array{b0, b1},
+                                             dot_packed16::widen<Bf16>(acc), fp16_ovfl));
+}
+
+/// @brief GFX12 V_DOT4_F32_{FP8,BF8}_{FP8,BF8}: four OCP FP8 (E4M3) or BF8 (E5M2)
+/// products from packed bytes plus an F32 accumulator.
+template <bool Bf8A, bool Bf8B>
+inline uint32_t gfx12_dot4_f32_fp8(uint32_t a, uint32_t b, uint32_t acc) {
+  using namespace gfx12_dot_detail;
+  const auto bytes = [](uint32_t v) {
+    return std::array<uint16_t, 4>{uint16_t(v & 0xff), uint16_t((v >> 8) & 0xff),
+                                   uint16_t((v >> 16) & 0xff), uint16_t(v >> 24)};
+  };
+  using A = std::conditional_t<Bf8A, Bf8Factor, Fp8Factor>;
+  using B = std::conditional_t<Bf8B, Bf8Factor, Fp8Factor>;
+  return gfx12_dot_terms<A, B, false>(bytes(a), bytes(b), acc);
+}
 } // namespace rocjitsu::amdgpu
